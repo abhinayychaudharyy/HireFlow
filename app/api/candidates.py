@@ -1,9 +1,13 @@
 from fastapi import APIRouter, Depends, UploadFile, File, HTTPException
 from sqlalchemy.orm import Session
+import os
+import uuid
+import shutil
 from app.dependencies.db import get_db
 from app.dependencies.auth import get_current_user
 from app.models.candidate import Candidate
 from app.services.upload_service import upload_resume
+from app.services.resume_parser import parse_resume
 
 router = APIRouter()
 
@@ -15,31 +19,47 @@ def add_candidate(
     job_id: str,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
-    current_user = Depends(get_current_user)
+    current_user=Depends(get_current_user)
 ):
+    temp_path = f"temp_{uuid.uuid4()}_{file.filename}"
+    
     try:
-        #  Upload file to Cloudinary
-        file_url = upload_resume(file.file)
+        # 1. Save file locally for parsing
+        with open(temp_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"File upload failed: {str(e)}")
+        # 2. Parse resume locally (Guarantees skills/projects capture even if Cloudinary has 401s)
+        parsed_data = parse_resume(temp_path)
 
-    try:
-        # Save candidate in DB
+        # 3. Upload to Cloudinary (for storage and URL)
+        # Re-open the local file for uploading
+        with open(temp_path, "rb") as f:
+            file_url = upload_resume(f, filename=file.filename)
+
+        # 4. Save candidate in DB with all data in one go
         candidate = Candidate(
             name=name,
             email=email,
-            resume=file_url,
-            job_id=job_id,
-            company_id=current_user.company_id
+            resume_url=file_url,
+            job_id=job_id.strip('"'),
+            company_id=current_user.company_id,
+            skills=parsed_data.get("skills"),
+            projects=parsed_data.get("projects")
         )
 
         db.add(candidate)
         db.commit()
         db.refresh(candidate)
 
-    except Exception as e:
-        db.rollback()  # VERY IMPORTANT
-        raise HTTPException(status_code=500, detail="Database error")
+        return candidate
 
-    return candidate
+    except Exception as e:
+        if db:
+            db.rollback()
+        print(f"ERROR: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Failed to process candidate: {str(e)}")
+
+    finally:
+        # 5. Cleanup local file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
